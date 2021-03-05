@@ -1,5 +1,3 @@
-FROM registry.access.redhat.com/ubi8/ubi:latest AS builder
-
 ################################################################################
 # This Dockerfile was generated from the template at distribution/src/docker/Dockerfile
 #
@@ -10,6 +8,8 @@ FROM registry.access.redhat.com/ubi8/ubi:latest AS builder
 # Build stage 0 `builder`:
 # Extract Elasticsearch artifact
 ################################################################################
+
+FROM registry.access.redhat.com/ubi8/ubi:latest AS builder
 
 # `tini` is a tiny but valid init for containers. This is used to cleanly
 # control how ES and any child processes are shut down.
@@ -32,34 +32,38 @@ RUN set -eux ; \
     mv ${tini_bin} /bin/tini ; \
     chmod +x /bin/tini
 
-RUN mkdir /usr/share/elasticsearch
-WORKDIR /usr/share/elasticsearch
+WORKDIR /opt
 
-RUN wget https://github.com/AdoptOpenJDK/openjdk15-binaries/releases/download/jdk15u-2021-01-22-02-31/OpenJDK15U-jdk_ppc64le_linux_hotspot_2021-01-22-02-31.tar.gz && \ 
-    tar -C /usr/local -xzf OpenJDK15U-jdk_ppc64le_linux_hotspot_2021-01-22-02-31.tar.gz && \
+RUN yum install -y wget git unzip
+
+RUN wget https://github.com/AdoptOpenJDK/openjdk15-binaries/releases/download/jdk15u-2021-01-22-02-31/OpenJDK15U-jdk_ppc64le_linux_hotspot_2021-01-22-02-31.tar.gz && \
+    tar -C /usr/local -xzf OpenJDK15U-jdk_ppc64le_linux_hotspot_2021-01-22-02-31.tar.gz &&\
     export JAVA_HOME=/usr/local/jdk-15.0.2+7/ && \
-    export JAVA13_HOME=/usr/local/jdk-15.0.2+7/ && \
+    export JAVA15_HOME=/usr/local/jdk-15.0.2+7/ && \
     export PATH=$PATH:/usr/local/jdk-15.0.2+7/bin && \
     ln -sf /usr/local/jdk-15.0.2+7/bin/java /usr/bin/
 
-RUN git clone https://github.com/elastic/elasticsearch.git && \
-    cd elasticsearch && git checkout 7.11 && \
-    wget https://raw.githubusercontent.com/Elayaraja-Dhanapal/build-scripts/ubi-image-elasticsearch/e/elasticsearch/elasticsearch_7.11.1.patch && \
-    git apply elasticsearch_7.11.1.patch &&
-    ./gradlew :distribution:archives:linux-ppc64le-tar:assemble --parallel
+RUN set -o errexit -o nounset && echo "Downloading Gradle" && wget --no-verbose --output-document=gradle.zip "https://services.gradle.org/distributions/gradle-6.8.3-bin.zip" && echo "Installing Gradle" && unzip gradle.zip && rm gradle.zip  && mv "gradle-6.8.3" "/usr/share/"     && ln --symbolic "/usr/share/gradle-6.8.3/bin/gradle" /usr/bin/gradle && echo "Testing Gradle installation" && gradle --version
 
-RUN mv /usr/share/elasticsearch/distribution/archives/linux-ppc64le-tar/build/distributions/elasticsearch-7.11.2-SNAPSHOT-linux-ppc64le.tar.gz /usr/share/elasticsearch && \
-	cd /usr/share/elasticsearch && rm -rf elasticsearch && \
-	tar -xvzf elasticsearch-7.11.2-SNAPSHOT-linux-ppc64le.tar.gz --strip-components=1 && \
-	rm -rf elasticsearch-7.11.2-SNAPSHOT-linux-ppc64le.tar.gz
+RUN git clone --single-branch --branch 7.11 https://github.com/elastic/elasticsearch.git && \
+    cd elasticsearch && wget https://raw.githubusercontent.com/Elayaraja-Dhanapal/build-scripts/ubi-image-elasticsearch/e/elasticsearch/elasticsearch_7.11.1.patch && \
+    git apply elasticsearch_7.11.1.patch && \
+    gradle :distribution:archives:linux-ppc64le-tar:assemble --parallel && \
+    mv ./distribution/archives/linux-ppc64le-tar/build/distributions/elasticsearch-7.11.2-SNAPSHOT-linux-ppc64le.tar.gz /opt
 
-RUN wget https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.7.0/jna-5.7.0.jar && \
-	mv jna-5.7.0.jar /usr/share/elasticsearch/lib/
+RUN mkdir /usr/share/elasticsearch
 
+WORKDIR /usr/share/elasticsearch
+
+RUN tar -zxf /opt/elasticsearch-7.11.2-SNAPSHOT-linux-ppc64le.tar.gz --strip-components=1
+
+RUN cd lib && \
+    rm -rf jna-* && \
+    wget https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.7.0/jna-5.7.0.jar
 
 # The distribution includes a `config` directory, no need to create it
 COPY config/elasticsearch.yml config/
-COPY bin/transform-log4j-config-7.11.1.jar /tmp/
+#COPY bin/transform-log4j-config-7.11.1.jar /tmp/
 
 # 1. Configure the distribution for Docker
 # 2. Ensure directories are created. Most already are, but make sure
@@ -72,11 +76,13 @@ COPY bin/transform-log4j-config-7.11.1.jar /tmp/
 # 8. Ensure that there are no files with setuid or setgid, in order to mitigate "stackclash" attacks.
 # 9. Ensure all files are world-readable by default. It should be possible to
 #    examine the contents of the image under any UID:GID
-RUN sed -i -e 's/ES_DISTRIBUTION_TYPE=tar/ES_DISTRIBUTION_TYPE=docker/' /usr/share/elasticsearch/bin/elasticsearch-env
-RUN mkdir -p config config/jvm.options.d data logs
-RUN chmod 0775 config config/jvm.options.d data logs
-COPY config/elasticsearch.yml config/log4j2.properties config/
-RUN chmod 0660 config/elasticsearch.yml config/log4j2.properties
+RUN sed -i -e 's/ES_DISTRIBUTION_TYPE=tar/ES_DISTRIBUTION_TYPE=docker/' bin/elasticsearch-env && \
+    mkdir -p config/jvm.options.d data logs plugins && \
+    chmod 0775 config config/jvm.options.d data logs plugins && \
+    chmod 0660 config/elasticsearch.yml config/log4j2*.properties && \
+    find ./jdk -type d -exec chmod 0755 {} + && \
+    find . -xdev -perm -4000 -exec chmod ug-s {} + && \
+    find . -type f -exec chmod o+r {} +
 
 ################################################################################
 # Build stage 1 (the actual Elasticsearch image):
@@ -85,7 +91,7 @@ RUN chmod 0660 config/elasticsearch.yml config/log4j2.properties
 # Add entrypoint
 ################################################################################
 
-registry.access.redhat.com/ubi8/ubi:latest
+FROM registry.access.redhat.com/ubi8/ubi:latest
 
 RUN for iter in {1..10}; do \
       yum update --setopt=tsflags=nodocs -y && \
